@@ -31,8 +31,7 @@ func TestMoveSingleFile(t *testing.T) {
 		t.Fatalf("failed: %v", r.Failed)
 	}
 	if len(r.Moved) != 1 {
-		t.Fatalf("expected 1 moved, got %d (moved=%v failed=%v)",
-			len(r.Moved), r.Moved, r.Failed)
+		t.Fatalf("expected 1 moved, got %d", len(r.Moved))
 	}
 
 	if _, err := os.Stat(src); !os.IsNotExist(err) {

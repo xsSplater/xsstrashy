@@ -83,6 +83,17 @@ func postMove(req *moveRequest) error {
 func staThreadBody() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	defer func() {
+		if r := recover(); r != nil {
+			staInitErr = fmt.Errorf("panic in staThreadBody: %v", r)
+			// Если паника случилась до close(staReady), закроем канал
+			select {
+			case <-staReady:
+			default:
+				close(staReady)
+			}
+		}
+	}()
 
 	if err := windows.CoInitializeEx(0,
 		windows.COINIT_APARTMENTTHREADED|windows.COINIT_DISABLE_OLE1DDE); err != nil {
