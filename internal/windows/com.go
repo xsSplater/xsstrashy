@@ -247,9 +247,7 @@ func sinkFinishOps(this, hrResult uintptr) uintptr {
 	if int32(hrResult) < 0 && s.err == nil {
 		s.err = fmt.Errorf("IFileOperation::FinishOperations: HRESULT 0x%08X", uint32(hrResult))
 	}
-	// Cleanup happens on the STA thread (from WndProc), not here —
-	// calling Unadvise or Release from inside a sink callback risks
-	// re-entering COM while the operation is still unwinding.
-	_ = PostMessage(staHWND, wmAppFinish, 0, 0)
+	// Устанавливаем флаг. staThreadBody сделает всё остальное после DispatchMessage.
+	finishRequested = true
 	return sOK
 }

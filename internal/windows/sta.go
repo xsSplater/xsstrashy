@@ -16,7 +16,6 @@ import (
 const (
 	wmAppMove   = WM_APP + 1
 	wmAppFinish = WM_APP + 2
-	wmAppCancel = WM_APP + 3
 
 	msgWindowClass = "xsstrashy_sta_v1"
 )
@@ -86,7 +85,6 @@ func staThreadBody() {
 	defer func() {
 		if r := recover(); r != nil {
 			staInitErr = fmt.Errorf("panic in staThreadBody: %v", r)
-			// Если паника случилась до close(staReady), закроем канал
 			select {
 			case <-staReady:
 			default:
@@ -124,20 +122,37 @@ func staThreadBody() {
 		}
 		TranslateMessage(&msg)
 		DispatchMessage(&msg)
+
+		// Выполняем работу ВНЕ WndProc, чтобы избежать вложенного cgocall!
+		drainQueue()
+	}
+}
+
+var finishRequested bool
+
+func drainQueue() {
+	if finishRequested {
+		finishRequested = false
+		finishOperation()
+		return
+	}
+	if currentOp != nil {
+		return
+	}
+	select {
+	case req := <-pendingCh:
+		startOperation(req)
+	default:
 	}
 }
 
 func createMessageWindow() (windows.HWND, error) {
 	wndProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
+		// WndProc больше ничего не делает, только будит GetMessage.
+		// Вся работа выполняется в staThreadBody после DispatchMessage.
 		switch msg {
-		case wmAppMove:
-			handleMoveMessage()
-			return 0
 		case wmAppFinish:
-			handleFinishMessage()
-			return 0
-		case wmAppCancel:
-			handleCancelMessage()
+			finishRequested = true
 			return 0
 		}
 		r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wparam, lparam)
@@ -167,7 +182,6 @@ func createMessageWindow() (windows.HWND, error) {
 		}
 	}
 
-	// HWND_MESSAGE = (HWND)-3.
 	hwndMessage := ^uintptr(2)
 	hwnd, _, err := procCreateWindowExW.Call(
 		0, uintptr(unsafe.Pointer(className)), 0, 0,
@@ -180,18 +194,9 @@ func createMessageWindow() (windows.HWND, error) {
 	return windows.HWND(hwnd), nil
 }
 
-func handleMoveMessage() {
-	if currentOp != nil {
-		return
-	}
-	select {
-	case req := <-pendingCh:
-		startOperation(req)
-	default:
-	}
-}
-
-func handleFinishMessage() {
+// Переименовали handleFinishMessage в finishOperation,
+// так как теперь она вызывается из drainQueue
+func finishOperation() {
 	op := currentOp
 	if op == nil {
 		return
@@ -243,16 +248,6 @@ func handleFinishMessage() {
 	case op.req.result <- res:
 	default:
 	}
-
-	select {
-	case <-pendingCh:
-		_ = PostMessage(staHWND, wmAppMove, 0, 0)
-	default:
-	}
-}
-
-func handleCancelMessage() {
-	// TODO
 }
 
 func startOperation(req *moveRequest) {
