@@ -152,7 +152,7 @@ func shellItemFromPath(path string) (uintptr, error) {
 // GC will not move it.
 
 type sinkObj struct {
-	vtbl         [sinkVtblSize]uintptr // MUST be first field
+	vtbl         uintptr // Указатель на таблицу методов
 	pinner       runtime.Pinner
 	req          *moveRequest
 	cookie       uint32
@@ -163,13 +163,14 @@ type sinkObj struct {
 var (
 	sinkVtblOnce sync.Once
 	sinkVtbl     [sinkVtblSize]uintptr
-	sinkCounter  atomic.Uintptr // just for logging / diagnostics
+	sinkCounter  atomic.Uintptr
 )
 
 func newSink(req *moveRequest) *sinkObj {
 	initSinkVtbl()
 	s := &sinkObj{req: req}
-	s.vtbl = sinkVtbl
+	// Сохраняем именно УКАЗАТЕЛЬ на первый элемент глобальной таблицы
+	s.vtbl = uintptr(unsafe.Pointer(&sinkVtbl[0]))
 	s.pinner.Pin(s)
 	sinkCounter.Add(1)
 	return s
