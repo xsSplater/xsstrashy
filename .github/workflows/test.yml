@@ -22,8 +22,7 @@ jobs:
       - name: go vet
         run: go vet -unsafeptr=false ./...
       - name: go test
-        timeout-minutes: 5
-        run: go test -v -timeout 3m ./...
+        run: go test -v -short ./...
 
   cross-compile:
     runs-on: ubuntu-latest

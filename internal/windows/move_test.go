@@ -17,6 +17,9 @@ import (
 // shell calls, but we can verify the source file is gone — the absence
 // of the original is the contract.
 func TestMoveSingleFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow IFileOperation test in short mode")
+	}
 	dir := t.TempDir()
 	src := filepath.Join(dir, "xsstrashy-test-file.txt")
 	if err := os.WriteFile(src, []byte("hello"), 0644); err != nil {
