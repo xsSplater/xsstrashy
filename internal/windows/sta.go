@@ -21,12 +21,11 @@ const (
 const ERROR_CLASS_ALREADY_EXISTS = syscall.Errno(1410)
 
 var (
-	staOnce         sync.Once
-	staErr          error
-	staReady        = make(chan struct{})
-	staHWND         uintptr
-	pendingCh       = make(chan *moveRequest, 16)
-	finishRequested bool
+	staOnce   sync.Once
+	staErr    error
+	staReady  = make(chan struct{})
+	staHWND   uintptr
+	pendingCh = make(chan *moveRequest, 16)
 )
 
 type moveRequest struct {
@@ -110,10 +109,7 @@ func staThreadBody() {
 		translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		dispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 
-		if finishRequested {
-			finishRequested = false
-			finishOperation()
-		} else if currentOp == nil {
+		if currentOp == nil {
 			select {
 			case req := <-pendingCh:
 				startOperation(req)

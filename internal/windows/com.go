@@ -9,7 +9,6 @@ import (
 	"unsafe"
 )
 
-// ole32 и shell32 уже объявлены в user32.go (windows.NewLazySystemDLL)
 var (
 	procCoInitializeEx              = ole32.NewProc("CoInitializeEx")
 	procCoUninitialize              = ole32.NewProc("CoUninitialize")
@@ -33,6 +32,8 @@ type GUID struct {
 }
 
 // comCall вызывает метод по индексу в VTable COM-объекта.
+//
+//go:nocheckptr
 func comCall(obj uintptr, index int, args ...uintptr) uintptr {
 	vtbl := *(*uintptr)(unsafe.Pointer(obj))
 	fn := *(*uintptr)(unsafe.Add(unsafe.Pointer(vtbl), uintptr(index)*unsafe.Sizeof(uintptr(0))))

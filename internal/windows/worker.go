@@ -5,6 +5,7 @@ package windows
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"unsafe"
 )
@@ -12,9 +13,10 @@ import (
 var currentOp *runningOp
 
 type runningOp struct {
-	req  *moveRequest
-	sink *sinkObj
-	ifOp uintptr
+	req        *moveRequest
+	sink       *sinkObj
+	ifOp       uintptr
+	addedPaths []string
 }
 
 func startOperation(req *moveRequest) {
@@ -35,8 +37,9 @@ func startOperation(req *moveRequest) {
 	}
 	sink.cookie = cookie
 
-	flags := uintptr(0x0040 | 0x0004 | 0x0400) // FOF_ALLOWUNDO | FOF_SILENT | FOF_NOERRORUI
-	hr = comCall(ifOp, 5, flags)               // SetOperationFlags
+	// FOFX_RECYCLEONDELETE | FOF_ALLOWUNDO | FOF_SILENT | FOF_NOERRORUI
+	flags := uintptr(0x00080000 | 0x0040 | 0x0004 | 0x0400)
+	hr = comCall(ifOp, 5, flags) // SetOperationFlags
 	if int32(hr) < 0 {
 		comCall(ifOp, 4, uintptr(cookie)) // Unadvise
 		comRelease(ifOp)
@@ -44,7 +47,7 @@ func startOperation(req *moveRequest) {
 		return
 	}
 
-	var added int
+	var addedPaths []string
 	for _, p := range req.paths {
 		if err := req.ctx.Err(); err != nil {
 			break
@@ -66,13 +69,15 @@ func startOperation(req *moveRequest) {
 		hr = comCall(ifOp, 18, item, 0) // DeleteItem
 		comRelease(item)
 		if int32(hr) < 0 {
+			log.Printf("[xsstrashy] DeleteItem failed for %s: HRESULT 0x%08X", p, uint32(hr))
 			continue
 		}
-		added++
+		log.Printf("[xsstrashy] DeleteItem queued for %s", p)
+		addedPaths = append(addedPaths, p)
 	}
 
 	// Если не добавлено ни одного элемента, не вызываем PerformOperations
-	if added == 0 {
+	if len(addedPaths) == 0 {
 		comCall(ifOp, 4, uintptr(cookie)) // Unadvise
 		comRelease(ifOp)
 		req.result <- moveResult{
@@ -81,17 +86,23 @@ func startOperation(req *moveRequest) {
 		return
 	}
 
-	currentOp = &runningOp{req: req, sink: sink, ifOp: ifOp}
+	currentOp = &runningOp{req: req, sink: sink, ifOp: ifOp, addedPaths: addedPaths}
 
+	// PerformOperations синхронный: он блокирует поток до завершения всех
+	// операций, после чего вызывает FinishOperations.
 	hr = comCall(ifOp, 21) // PerformOperations
 	if int32(hr) < 0 {
+		log.Printf("[xsstrashy] PerformOperations failed: HRESULT 0x%08X", uint32(hr))
 		currentOp = nil
 		comCall(ifOp, 4, uintptr(cookie)) // Unadvise
 		comRelease(ifOp)
 		req.result <- moveResult{failed: allFailed(req.paths, fmt.Errorf("PerformOperations: 0x%08X", uint32(hr)))}
 		return
 	}
-	// Результат будет отправлен в finishOperation, когда придёт FinishOperations.
+	log.Printf("[xsstrashy] PerformOperations returned S_OK")
+
+	// Поскольку PerformOperations синхронный, завершаем операцию сразу.
+	finishOperation()
 }
 
 func finishOperation() {
@@ -111,8 +122,8 @@ func finishOperation() {
 		op.sink.release()
 	}
 
-	total := len(op.req.paths)
-	okCount := op.sink.success
+	total := len(op.addedPaths)
+	okCount := int(op.sink.success)
 	var sinkErr error
 	if op.sink != nil {
 		sinkErr = op.sink.lastErr
@@ -121,19 +132,19 @@ func finishOperation() {
 	var res moveResult
 	switch {
 	case okCount == total:
-		res.moved = append([]string(nil), op.req.paths...)
+		res.moved = append([]string(nil), op.addedPaths...)
 	case okCount == 0:
 		if sinkErr == nil {
 			sinkErr = fmt.Errorf("operation failed")
 		}
-		res.failed = allFailed(op.req.paths, sinkErr)
+		res.failed = allFailed(op.addedPaths, sinkErr)
 	default:
 		if sinkErr == nil {
 			sinkErr = fmt.Errorf("partial failure")
 		}
-		res.moved = append([]string(nil), op.req.paths[:okCount]...)
+		res.moved = append([]string(nil), op.addedPaths[:okCount]...)
 		res.failed = make(map[string]error, total-okCount)
-		for _, p := range op.req.paths[okCount:] {
+		for _, p := range op.addedPaths[okCount:] {
 			res.failed[p] = sinkErr
 		}
 	}
