@@ -46,24 +46,39 @@ func startOperation(req *moveRequest) {
 
 	var added int
 	for _, p := range req.paths {
+		if err := req.ctx.Err(); err != nil {
+			break
+		}
 		if _, err := os.Lstat(p); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			// Ошибки доступа и т.п. можно запомнить, но для простоты пропустим
 			continue
 		}
-		item, err := shellItemFromPath(p)
+		norm, err := normalizePath(p)
+		if err != nil {
+			continue
+		}
+		item, err := shellItemFromPath(norm)
 		if err != nil {
 			continue
 		}
 		hr = comCall(ifOp, 18, item, 0) // DeleteItem
 		comRelease(item)
 		if int32(hr) < 0 {
-			// Ошибку можно записать в failed
 			continue
 		}
 		added++
+	}
+
+	// Если не добавлено ни одного элемента, не вызываем PerformOperations
+	if added == 0 {
+		comCall(ifOp, 4, uintptr(cookie)) // Unadvise
+		comRelease(ifOp)
+		req.result <- moveResult{
+			failed: make(map[string]error),
+		}
+		return
 	}
 
 	currentOp = &runningOp{req: req, sink: sink, ifOp: ifOp}

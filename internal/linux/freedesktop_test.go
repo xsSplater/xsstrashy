@@ -294,9 +294,10 @@ func TestMoveCrossDevice(t *testing.T) {
 	}
 
 	// И только теперь убираем за собой, если создали корзину в /dev/shm
-	if foundPath == top1 {
+	switch foundPath {
+	case top1:
 		os.RemoveAll(filepath.Join("/dev/shm", ".Trash"))
-	} else if foundPath == top2 {
+	case top2:
 		os.RemoveAll(filepath.Join("/dev/shm", ".Trash-"+uid))
 	}
 }

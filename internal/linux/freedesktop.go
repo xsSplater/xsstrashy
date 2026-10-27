@@ -247,7 +247,7 @@ func moveOne(ctx context.Context, absPath string) error {
 // trash manager sees a broken entry for a still-existing file - but no
 // data is lost. The reverse order (rename first) can leave a file stuck
 // in trash with no metadata, which is worse.
-func moveAtomic(ctx context.Context, src string, td trashDir) error {
+func moveAtomic(_ context.Context, src string, td trashDir) error {
 	base := filepath.Base(src)
 	infoPath, infoFile, name, err := reserveInfo(td, base)
 	if err != nil {

@@ -22,8 +22,8 @@ jobs:
       - name: go vet
         run: go vet -unsafeptr=false ./...
       - name: go test
-        # Отключаем -race для Windows, так как checkptr конфликтует с syscall COM
-        run: go test -v ./...
+        timeout-minutes: 5
+        run: go test -v -timeout 3m ./...
 
   cross-compile:
     runs-on: ubuntu-latest
