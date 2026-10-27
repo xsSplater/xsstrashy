@@ -23,8 +23,4 @@ func movePaths(ctx context.Context, paths []string) error {
 
 func isSupported() bool { return true }
 
-func isAvailable() bool {
-	// IFileOperation is available on Vista+. If we are running on a
-	// supported Windows version, the bin is usable.
-	return true
-}
+func isAvailable() bool { return true }

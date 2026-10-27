@@ -45,7 +45,7 @@ func TestMoveSkipsNonexistent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	r := Move(ctx, []string{`Z:\this\does\not\exist\xsstrashy.txt`})
+	r := Move(ctx, []string{`C:\this\does\not\exist\xsstrashy.txt`})
 	if len(r.Failed) != 0 {
 		t.Fatalf("non-existent path should not appear in Failed: %v", r.Failed)
 	}

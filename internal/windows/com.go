@@ -5,249 +5,86 @@ package windows
 
 import (
 	"fmt"
-	"runtime"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"unsafe"
-
-	"golang.org/x/sys/windows"
 )
 
-var procSHCreateItemFromParsingName = shell32.NewProc("SHCreateItemFromParsingName")
-var procCoCreateInstance = ole32.NewProc("CoCreateInstance")
-
-// GUIDs
+// ole32 и shell32 уже объявлены в user32.go (windows.NewLazySystemDLL)
 var (
-	clsidFileOperation = windows.GUID{Data1: 0x3ad05575, Data2: 0x8857, Data3: 0x4850, Data4: [8]byte{0x92, 0x77, 0x11, 0xb8, 0x5b, 0xdb, 0x8e, 0x09}}
-	iidFileOperation   = windows.GUID{Data1: 0x947aab5f, Data2: 0x0a5c, Data3: 0x4c13, Data4: [8]byte{0xb4, 0xd6, 0x4b, 0xf7, 0x83, 0x6f, 0xc9, 0xf8}}
-	iidShellItem       = windows.GUID{Data1: 0x43826d1e, Data2: 0xe718, Data3: 0x42ee, Data4: [8]byte{0xbc, 0x55, 0xa1, 0xe2, 0x61, 0xc3, 0x7b, 0xfe}}
-	iidProgressSink    = windows.GUID{Data1: 0x04b0f1a7, Data2: 0x9490, Data3: 0x44bc, Data4: [8]byte{0x96, 0xe1, 0x42, 0x96, 0xa3, 0x12, 0x52, 0xe2}}
-	iidIUnknown        = windows.GUID{Data1: 0x00000000, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+	procCoInitializeEx              = ole32.NewProc("CoInitializeEx")
+	procCoUninitialize              = ole32.NewProc("CoUninitialize")
+	procCoCreateInstance            = ole32.NewProc("CoCreateInstance")
+	procSHCreateItemFromParsingName = shell32.NewProc("SHCreateItemFromParsingName")
 )
 
-const (
-	clsctxAll    = 0x17
-	sOK          = 0
-	eNoInterface = 0x80004002
-	ePointer     = 0x80004003
+var (
+	CLSID_FileOperation            = GUID{0x3AD05575, 0x8857, 0x4850, [8]byte{0x92, 0x77, 0x11, 0xB8, 0x5B, 0xDB, 0x8E, 0x09}}
+	IID_IFileOperation             = GUID{0x947AAB5F, 0x0A5C, 0x4C13, [8]byte{0xB4, 0xD6, 0x4B, 0xF7, 0x83, 0x6F, 0xC9, 0xF8}}
+	IID_IShellItem                 = GUID{0x43826D1E, 0xE718, 0x42EE, [8]byte{0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE}}
+	IID_IFileOperationProgressSink = GUID{0x04B0F1A7, 0x9490, 0x44BC, [8]byte{0x96, 0xE1, 0x42, 0x96, 0xA3, 0x12, 0x52, 0xE2}}
+	IID_IUnknown                   = GUID{0x00000000, 0x0000, 0x0000, [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
 )
 
-// IFileOperation vtable indices (IUnknown = 0,1,2).
-const (
-	ifOpIdxAdvise     = 3
-	ifOpIdxUnadvise   = 4
-	ifOpIdxSetFlags   = 5
-	ifOpIdxDeleteItem = 18
-	ifOpIdxPerformOps = 21
-)
+type GUID struct {
+	Data1 uint32
+	Data2 uint16
+	Data3 uint16
+	Data4 [8]byte
+}
 
-// IFileOperationProgressSink vtable indices.
-const (
-	sinkIdxQueryInterface = 0
-	sinkIdxAddRef         = 1
-	sinkIdxRelease        = 2
-	sinkIdxStartOps       = 3
-	sinkIdxFinishOps      = 4
-	sinkIdxPostDeleteItem = 12
-	sinkVtblSize          = 19
-)
-
-// vcall performs a virtual call on a COM object.
-func vcall(obj uintptr, index int, args ...uintptr) uintptr {
+// comCall вызывает метод по индексу в VTable COM-объекта.
+func comCall(obj uintptr, index int, args ...uintptr) uintptr {
 	vtbl := *(*uintptr)(unsafe.Pointer(obj))
 	fn := *(*uintptr)(unsafe.Add(unsafe.Pointer(vtbl), uintptr(index)*unsafe.Sizeof(uintptr(0))))
-	r, _, _ := syscall.SyscallN(fn, append([]uintptr{obj}, args...)...)
-	return r
+	allArgs := append([]uintptr{obj}, args...)
+	ret, _, _ := syscall.SyscallN(fn, allArgs...)
+	return ret
 }
 
 func comRelease(obj uintptr) {
 	if obj != 0 {
-		vcall(obj, 2)
+		comCall(obj, 2) // IUnknown::Release
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────
-// IFileOperation wrappers
-// ─────────────────────────────────────────────────────────────────
+func checkHR(hr uintptr, context string) error {
+	if int32(hr) < 0 {
+		return fmt.Errorf("%s: HRESULT 0x%08X", context, uint32(hr))
+	}
+	return nil
+}
 
-func ifileOpCreate() (uintptr, error) {
+// Создание экземпляра COM-объекта.
+func coCreateInstance(clsid, iid *GUID) (uintptr, error) {
 	var obj uintptr
 	hr, _, _ := procCoCreateInstance.Call(
-		uintptr(unsafe.Pointer(&clsidFileOperation)),
-		0, clsctxAll,
-		uintptr(unsafe.Pointer(&iidFileOperation)),
+		uintptr(unsafe.Pointer(clsid)),
+		0,
+		0x17, // CLSCTX_ALL
+		uintptr(unsafe.Pointer(iid)),
 		uintptr(unsafe.Pointer(&obj)),
 	)
-	if int32(hr) < 0 {
-		return 0, fmt.Errorf("CoCreateInstance(IFileOperation): HRESULT 0x%08X", uint32(hr))
+	if err := checkHR(hr, "CoCreateInstance"); err != nil {
+		return 0, err
 	}
 	return obj, nil
 }
 
-func ifileOpAdvise(obj uintptr, s *sinkObj) (uint32, error) {
-	var cookie uint32
-	hr := vcall(obj, ifOpIdxAdvise, uintptr(unsafe.Pointer(s)), uintptr(unsafe.Pointer(&cookie)))
-	if int32(hr) < 0 {
-		return 0, fmt.Errorf("IFileOperation::Advise: HRESULT 0x%08X", uint32(hr))
-	}
-	return cookie, nil
-}
-
-func ifileOpUnadvise(obj uintptr, cookie uint32) {
-	vcall(obj, ifOpIdxUnadvise, uintptr(cookie))
-}
-
-func ifileOpSetFlags(obj uintptr, flags uint32) error {
-	hr := vcall(obj, ifOpIdxSetFlags, uintptr(flags))
-	if int32(hr) < 0 {
-		return fmt.Errorf("IFileOperation::SetOperationFlags: HRESULT 0x%08X", uint32(hr))
-	}
-	return nil
-}
-
-func ifileOpDeleteItem(obj uintptr, shellItem uintptr) error {
-	hr := vcall(obj, ifOpIdxDeleteItem, shellItem)
-	if int32(hr) < 0 {
-		return fmt.Errorf("IFileOperation::DeleteItem: HRESULT 0x%08X", uint32(hr))
-	}
-	return nil
-}
-
-func ifileOpPerform(obj uintptr) error {
-	hr := vcall(obj, ifOpIdxPerformOps)
-	if int32(hr) < 0 {
-		return fmt.Errorf("IFileOperation::PerformOperations: HRESULT 0x%08X", uint32(hr))
-	}
-	return nil
-}
-
+// Создание IShellItem из пути.
 func shellItemFromPath(path string) (uintptr, error) {
-	p16, err := windows.UTF16PtrFromString(path)
+	pathPtr, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, err
 	}
 	var item uintptr
 	hr, _, _ := procSHCreateItemFromParsingName.Call(
-		uintptr(unsafe.Pointer(p16)),
+		uintptr(unsafe.Pointer(pathPtr)),
 		0,
-		uintptr(unsafe.Pointer(&iidShellItem)),
+		uintptr(unsafe.Pointer(&IID_IShellItem)),
 		uintptr(unsafe.Pointer(&item)),
 	)
-	if int32(hr) < 0 {
-		return 0, fmt.Errorf("SHCreateItemFromParsingName: HRESULT 0x%08X", uint32(hr))
+	if err := checkHR(hr, "SHCreateItemFromParsingName"); err != nil {
+		return 0, err
 	}
 	return item, nil
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Sink implementation via runtime.Pinner.
-// ─────────────────────────────────────────────────────────────────
-//
-// sinkObj is a real COM object: its first field is the vtable pointer.
-// runtime.Pinner pins the object in memory, so *sinkObj is a stable
-// C-address for the object's lifetime. COM passes that pointer back
-// as "this" in every callback. We convert it back to *sinkObj via
-// unsafe.Pointer — this works because the object was pinned and Go's
-// GC will not move it.
-
-type sinkObj struct {
-	vtbl         uintptr // Указатель на таблицу методов
-	pinner       runtime.Pinner
-	req          *moveRequest
-	cookie       uint32
-	successCount int
-	err          error
-}
-
-var (
-	sinkVtblOnce sync.Once
-	sinkVtbl     [sinkVtblSize]uintptr
-	sinkCounter  atomic.Uintptr
-)
-
-func newSink(req *moveRequest) *sinkObj {
-	initSinkVtbl()
-	s := &sinkObj{req: req}
-	// Сохраняем именно УКАЗАТЕЛЬ на первый элемент глобальной таблицы
-	s.vtbl = uintptr(unsafe.Pointer(&sinkVtbl[0]))
-	s.pinner.Pin(s)
-	sinkCounter.Add(1)
-	return s
-}
-
-func (s *sinkObj) release() {
-	// Не открепляем объект. Если COM всё ещё держит ссылку,
-	// GC не должен освобождать память.
-	// s.pinner.Unpin()
-	runtime.KeepAlive(s)
-}
-
-func sinkFromThis(this uintptr) *sinkObj {
-	return (*sinkObj)(unsafe.Pointer(this))
-}
-
-func initSinkVtbl() {
-	sinkVtblOnce.Do(func() {
-		sinkVtbl[sinkIdxQueryInterface] = syscall.NewCallback(sinkQueryInterface)
-		sinkVtbl[sinkIdxAddRef] = syscall.NewCallback(sinkAddRef)
-		sinkVtbl[sinkIdxRelease] = syscall.NewCallback(sinkRelease)
-		sinkVtbl[sinkIdxStartOps] = syscall.NewCallback(sinkStartOps)
-		sinkVtbl[sinkIdxFinishOps] = syscall.NewCallback(sinkFinishOps)
-		sinkVtbl[sinkIdxPostDeleteItem] = syscall.NewCallback(sinkPostDeleteItem)
-		for i := 0; i < sinkVtblSize; i++ {
-			if sinkVtbl[i] == 0 {
-				sinkVtbl[i] = syscall.NewCallback(sinkNoop)
-			}
-		}
-	})
-}
-
-func sinkQueryInterface(this, riid, ppv uintptr) uintptr {
-	if riid == 0 || ppv == 0 {
-		return ePointer
-	}
-	requested := (*windows.GUID)(unsafe.Pointer(riid))
-	if *requested == iidProgressSink || *requested == iidIUnknown {
-		*(*uintptr)(unsafe.Pointer(ppv)) = this
-		sinkAddRef(this)
-		return sOK
-	}
-	return eNoInterface
-}
-
-func sinkAddRef(this uintptr) uintptr {
-	return 2
-}
-
-func sinkRelease(this uintptr) uintptr {
-	return 1
-}
-
-func sinkStartOps(this uintptr) uintptr {
-	return sOK
-}
-
-func sinkNoop(this uintptr) uintptr {
-	return sOK
-}
-
-func sinkPostDeleteItem(this, flags, psiItem, hrDelete, psiNewlyCreated uintptr) uintptr {
-	s := sinkFromThis(this)
-	if int32(hrDelete) >= 0 {
-		s.successCount++
-	} else if s.err == nil {
-		s.err = fmt.Errorf("delete failed: HRESULT 0x%08X", uint32(hrDelete))
-	}
-	return sOK
-}
-
-func sinkFinishOps(this, hrResult uintptr) uintptr {
-	s := sinkFromThis(this)
-	if int32(hrResult) < 0 && s.err == nil {
-		s.err = fmt.Errorf("IFileOperation::FinishOperations: HRESULT 0x%08X", uint32(hrResult))
-	}
-	// Устанавливаем флаг. staThreadBody сделает всё остальное после DispatchMessage.
-	finishRequested = true
-	return sOK
 }

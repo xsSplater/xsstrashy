@@ -4,59 +4,39 @@
 package windows
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
-
-	"golang.org/x/sys/windows"
 )
 
 const (
-	wmAppMove   = WM_APP + 1
-	wmAppFinish = WM_APP + 2
-
-	msgWindowClass = "xsstrashy_sta_v1"
+	WM_APP_MOVE   = 0x8001
+	WM_APP_FINISH = 0x8002
+	classname     = "xsstrashy_sta_v1"
 )
 
-const errClassAlreadyExists syscall.Errno = 1410
+const ERROR_CLASS_ALREADY_EXISTS = syscall.Errno(1410)
 
-// moveRequest is a single MoveContext call forwarded to the STA thread.
+var (
+	staOnce         sync.Once
+	staErr          error
+	staReady        = make(chan struct{})
+	staHWND         uintptr
+	pendingCh       = make(chan *moveRequest, 16)
+	finishRequested bool
+)
+
 type moveRequest struct {
 	paths  []string
 	result chan moveResult
-	ctx    contextDone
+	ctx    context.Context
 }
-
 type moveResult struct {
 	moved  []string
 	failed map[string]error
-}
-
-// contextDone is the minimal subset of context.Context used inside
-// the windows package.
-type contextDone interface {
-	Done() <-chan struct{}
-	Err() error
-}
-
-var (
-	staOnce     sync.Once
-	staInitErr  error
-	staReady    = make(chan struct{})
-	staThreadID uint32
-	staHWND     windows.HWND
-
-	pendingCh = make(chan *moveRequest, 16)
-
-	currentOp *runningOp
-)
-
-type runningOp struct {
-	req  *moveRequest
-	sink *sinkObj
-	ifOp uintptr
 }
 
 func staInit() error {
@@ -64,7 +44,7 @@ func staInit() error {
 		go staThreadBody()
 		<-staReady
 	})
-	return staInitErr
+	return staErr
 }
 
 func postMove(req *moveRequest) error {
@@ -74,9 +54,13 @@ func postMove(req *moveRequest) error {
 	select {
 	case pendingCh <- req:
 	default:
-		return fmt.Errorf("xsstrashy: request queue full")
+		return fmt.Errorf("request queue full")
 	}
-	return PostMessage(staHWND, wmAppMove, 0, 0)
+	hwnd := syscall.Handle(staHWND)
+	user32 := syscall.NewLazyDLL("user32.dll")
+	postMessage := user32.NewProc("PostMessageW")
+	postMessage.Call(uintptr(hwnd), WM_APP_MOVE, 0, 0)
+	return nil
 }
 
 func staThreadBody() {
@@ -84,7 +68,7 @@ func staThreadBody() {
 	defer runtime.UnlockOSThread()
 	defer func() {
 		if r := recover(); r != nil {
-			staInitErr = fmt.Errorf("panic in staThreadBody: %v", r)
+			staErr = fmt.Errorf("panic: %v", r)
 			select {
 			case <-staReady:
 			default:
@@ -93,236 +77,106 @@ func staThreadBody() {
 		}
 	}()
 
-	if err := windows.CoInitializeEx(0,
-		windows.COINIT_APARTMENTTHREADED|windows.COINIT_DISABLE_OLE1DDE); err != nil {
-		staInitErr = fmt.Errorf("CoInitializeEx: %w", err)
+	hr, _, _ := procCoInitializeEx.Call(0, 0x2|0x4) // COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE
+	if int32(hr) < 0 {
+		staErr = fmt.Errorf("CoInitializeEx failed: 0x%08X", uint32(hr))
 		close(staReady)
 		return
 	}
-	defer windows.CoUninitialize()
-
-	staThreadID = windows.GetCurrentThreadId()
+	defer procCoUninitialize.Call()
 
 	hwnd, err := createMessageWindow()
 	if err != nil {
-		staInitErr = fmt.Errorf("create message window: %w", err)
+		staErr = err
 		close(staReady)
 		return
 	}
 	staHWND = hwnd
-	defer DestroyWindow(hwnd)
+	defer destroyWindow(hwnd)
 
 	close(staReady)
 
+	user32 := syscall.NewLazyDLL("user32.dll")
+	getMessage := user32.NewProc("GetMessageW")
+	translateMessage := user32.NewProc("TranslateMessage")
+	dispatchMessage := user32.NewProc("DispatchMessageW")
+
 	var msg MSG
 	for {
-		ret, _ := GetMessage(&msg, 0, 0, 0)
-		if ret == 0 || ret == -1 {
+		ret, _, _ := getMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if int32(ret) <= 0 {
 			return
 		}
-		TranslateMessage(&msg)
-		DispatchMessage(&msg)
+		translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		dispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 
-		// Выполняем работу ВНЕ WndProc, чтобы избежать вложенного cgocall!
-		drainQueue()
-	}
-}
-
-var finishRequested bool
-
-func drainQueue() {
-	if finishRequested {
-		finishRequested = false
-		finishOperation()
-		return
-	}
-	if currentOp != nil {
-		return
-	}
-	select {
-	case req := <-pendingCh:
-		startOperation(req)
-	default:
-	}
-}
-
-func createMessageWindow() (windows.HWND, error) {
-	wndProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
-		// WndProc больше ничего не делает, только будит GetMessage.
-		// Вся работа выполняется в staThreadBody после DispatchMessage.
-		switch msg {
-		case wmAppFinish:
-			finishRequested = true
-			return 0
+		if finishRequested {
+			finishRequested = false
+			finishOperation()
+		} else if currentOp == nil {
+			select {
+			case req := <-pendingCh:
+				startOperation(req)
+			default:
+			}
 		}
-		r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wparam, lparam)
+	}
+}
+
+func createMessageWindow() (uintptr, error) {
+	user32 := syscall.NewLazyDLL("user32.dll")
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	getModuleHandle := kernel32.NewProc("GetModuleHandleW")
+	registerClassEx := user32.NewProc("RegisterClassExW")
+	createWindowEx := user32.NewProc("CreateWindowExW")
+	defWindowProc := user32.NewProc("DefWindowProcW")
+
+	wndProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
+		r, _, _ := defWindowProc.Call(hwnd, uintptr(msg), wparam, lparam)
 		return r
 	})
 
-	hInst, err := GetModuleHandle()
-	if err != nil {
-		return 0, err
+	hInst, _, _ := getModuleHandle.Call(0)
+	className, _ := syscall.UTF16PtrFromString(classname)
+
+	type WNDCLASSEX struct {
+		cbSize        uint32
+		style         uint32
+		lpfnWndProc   uintptr
+		cbClsExtra    int32
+		cbWndExtra    int32
+		hInstance     syscall.Handle
+		hIcon         syscall.Handle
+		hCursor       syscall.Handle
+		hbrBackground syscall.Handle
+		lpszMenuName  *uint16
+		lpszClassName *uint16
+		hIconSm       syscall.Handle
+	}
+	var wc WNDCLASSEX
+	wc.cbSize = uint32(unsafe.Sizeof(wc))
+	wc.lpfnWndProc = wndProc
+	wc.hInstance = syscall.Handle(hInst)
+	wc.lpszClassName = className
+
+	ret, _, err := registerClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+	if ret == 0 && err != ERROR_CLASS_ALREADY_EXISTS {
+		return 0, fmt.Errorf("RegisterClassEx: %w", err)
 	}
 
-	className, err := windows.UTF16PtrFromString(msgWindowClass)
-	if err != nil {
-		return 0, err
-	}
-
-	var wc WndClassEx
-	wc.CbSize = uint32(unsafe.Sizeof(wc))
-	wc.LpfnWndProc = wndProc
-	wc.HInstance = hInst
-	wc.LpszClassName = className
-
-	r1, _, err := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
-	if r1 == 0 {
-		if err != errClassAlreadyExists {
-			return 0, err
-		}
-	}
-
-	hwndMessage := ^uintptr(2)
-	hwnd, _, err := procCreateWindowExW.Call(
+	hwndMsg := ^uintptr(2) // HWND_MESSAGE = (HWND)-3
+	hwnd, _, err := createWindowEx.Call(
 		0, uintptr(unsafe.Pointer(className)), 0, 0,
-		0, 0, 0, 0,
-		hwndMessage, 0, uintptr(hInst), 0,
+		0, 0, 0, 0, hwndMsg, 0, hInst, 0,
 	)
 	if hwnd == 0 {
-		return 0, err
+		return 0, fmt.Errorf("CreateWindowEx: %w", err)
 	}
-	return windows.HWND(hwnd), nil
+	return hwnd, nil
 }
 
-// Переименовали handleFinishMessage в finishOperation,
-// так как теперь она вызывается из drainQueue
-func finishOperation() {
-	op := currentOp
-	if op == nil {
-		return
-	}
-	currentOp = nil
-
-	if op.ifOp != 0 && op.sink != nil {
-		ifileOpUnadvise(op.ifOp, op.sink.cookie)
-	}
-	if op.ifOp != 0 {
-		comRelease(op.ifOp)
-	}
-	if op.sink != nil {
-		op.sink.release()
-	}
-
-	total := len(op.req.paths)
-	okCount := 0
-	var sinkErr error
-	if op.sink != nil {
-		okCount = op.sink.successCount
-		sinkErr = op.sink.err
-	}
-
-	var res moveResult
-	switch {
-	case okCount == total:
-		res.moved = append([]string(nil), op.req.paths...)
-	case okCount == 0:
-		if sinkErr == nil {
-			sinkErr = fmt.Errorf("IFileOperation failed")
-		}
-		res.failed = make(map[string]error, total)
-		for _, p := range op.req.paths {
-			res.failed[p] = sinkErr
-		}
-	default:
-		if sinkErr == nil {
-			sinkErr = fmt.Errorf("IFileOperation partially failed")
-		}
-		res.moved = append([]string(nil), op.req.paths[:okCount]...)
-		res.failed = make(map[string]error, total-okCount)
-		for _, p := range op.req.paths[okCount:] {
-			res.failed[p] = sinkErr
-		}
-	}
-
-	select {
-	case op.req.result <- res:
-	default:
-	}
-}
-
-func startOperation(req *moveRequest) {
-	sink := newSink(req)
-
-	ifOp, err := ifileOpCreate()
-	if err != nil {
-		sink.err = err
-		sink.release()
-		select {
-		case req.result <- moveResult{failed: allFailed(req.paths, err)}:
-		default:
-		}
-		return
-	}
-
-	cookie, err := ifileOpAdvise(ifOp, sink)
-	if err != nil {
-		comRelease(ifOp)
-		sink.err = err
-		sink.release()
-		select {
-		case req.result <- moveResult{failed: allFailed(req.paths, err)}:
-		default:
-		}
-		return
-	}
-	sink.cookie = cookie
-
-	const flags = 0x00010000 | 0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x00080000
-	if err := ifileOpSetFlags(ifOp, flags); err != nil {
-		ifileOpUnadvise(ifOp, cookie)
-		comRelease(ifOp)
-		sink.err = err
-		sink.release()
-		select {
-		case req.result <- moveResult{failed: allFailed(req.paths, err)}:
-		default:
-		}
-		return
-	}
-
-	for _, p := range req.paths {
-		norm, err := normalizePath(p)
-		if err != nil {
-			continue
-		}
-		item, err := shellItemFromPath(norm)
-		if err != nil {
-			continue
-		}
-		_ = ifileOpDeleteItem(ifOp, item)
-		comRelease(item)
-	}
-
-	currentOp = &runningOp{req: req, sink: sink, ifOp: ifOp}
-
-	if err := ifileOpPerform(ifOp); err != nil {
-		currentOp = nil
-		ifileOpUnadvise(ifOp, cookie)
-		comRelease(ifOp)
-		sink.err = err
-		sink.release()
-		select {
-		case req.result <- moveResult{failed: allFailed(req.paths, err)}:
-		default:
-		}
-		return
-	}
-}
-
-func allFailed(paths []string, err error) map[string]error {
-	m := make(map[string]error, len(paths))
-	for _, p := range paths {
-		m[p] = err
-	}
-	return m
+func destroyWindow(hwnd uintptr) {
+	user32 := syscall.NewLazyDLL("user32.dll")
+	destroyWindowProc := user32.NewProc("DestroyWindow")
+	destroyWindowProc.Call(hwnd)
 }

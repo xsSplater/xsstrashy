@@ -1,5 +1,6 @@
 //go:build windows
 
+// xsstrashy/internal/windows/user32.go
 package windows
 
 import (
